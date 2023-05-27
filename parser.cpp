@@ -49,6 +49,7 @@ struct CAFF
 {
     CAFFHeader header;
     CAFFCredits credits;
+    std::vector<CIFF> ciffs;
 };
 
 void write_jpeg(std::vector<uint8_t> &pixels, uint64_t width, uint64_t height, string output_filename)
@@ -86,7 +87,8 @@ void write_jpeg(std::vector<uint8_t> &pixels, uint64_t width, uint64_t height, s
     jpeg_destroy_compress(&cinfo);
 }
 
-std::string createJpgPath(std::string ciffPath)
+//Creates the .jpg file name from the .ciff/.caff version
+std::string createJpgName(std::string ciffPath)
 {
     size_t last_dot = ciffPath.find_last_of(".");
     if (last_dot != std::string::npos)
@@ -96,6 +98,7 @@ std::string createJpgPath(std::string ciffPath)
     ciffPath.append(".jpg"); // Append the new extension
     return ciffPath;
 }
+
 CIFFHeader read_CiffHeader(std::ifstream &file)
 {
     CIFFHeader header;
@@ -129,12 +132,6 @@ CIFFHeader read_CiffHeader(std::ifstream &file)
 
 CAFFHeader read_CaffHeader(std::ifstream &file)
 {
-
-    /*if(!file) {
-        std::cerr << "Could not open file " << argv[1] << "\n";
-        return 1;
-    }*/
-
     CAFFHeader header;
 
     file.read(header.magic, 4);
@@ -161,6 +158,7 @@ CAFFCredits read_credits(std::ifstream &file)
     return credits;
 }
 
+//Creates a ciff object
 CIFF constructCiff(std::ifstream &file)
 {
     CIFF ciff;
@@ -178,114 +176,174 @@ CIFF constructCiff(std::ifstream &file)
     return ciff;
 }
 
+//Creates a jpg file from a ciff object and saves it
 int createJpgFromCiff(CIFF ciff, string filePath)
 {
     if ((ciff.header.height == 0 || ciff.header.width == 0) && ciff.pixels.size() != 0)
         throw std::runtime_error("Wrong dimensions");
 
-    string ciffPath = createJpgPath(filePath);
+    string ciffPath = createJpgName(filePath);
     // Convert to JPEG
     write_jpeg(ciff.pixels, ciff.header.width, ciff.header.height, ciffPath);
 
     return 0;
 }
 
-int handleCaff(string filePath)
+//Finds the next appearance of the given magic string, then sets the read position to the start of this magic string
+void findMagic(std::ifstream &file, const std::string magic)
+{
+    char c;
+    std::string str;
+    while (file.get(c))
+    {
+        str += c;
+        if (str.size() > magic.size())
+        {
+            str.erase(str.begin());
+        }
+        if (str == magic)
+        {
+            file.seekg(-magic.size(), std::ios::cur);
+            break;
+        }
+    }
+}
+
+//Handles the ciff scenario
+CAFF handleCaff(string filePath)
 {
 
     std::ifstream file(filePath);
     if (!file)
     {
         std::cerr << "Failed to open the file" << std::endl;
-        return -1;
+        throw runtime_error("Failed to open the file");
     }
 
-    uint8_t id;
-    uint64_t length;
-    uint64_t duration;
-
-    file.read((char *)&id, 1);
-    file.read((char *)&length, 8);
-
-    if(id < 1 || id > 3){
-         throw std::runtime_error("Wrong id");
-    }
-
+    findMagic(file, "CAFF");
     CAFFHeader header = read_CaffHeader(file);
 
-    file.read((char *)&id, 1);
-    file.read((char *)&length, 8);
+    CAFF caff;
+    caff.header = header;
+    uint8_t ciffCount = 0;
 
-    CAFFCredits credits = read_credits(file);
-
-    for (uint i = 0; i < header.numAnimations; i++)
+    //Read blocks
+    while (!file.eof())
     {
+        uint8_t id;
+        uint64_t length;
+        uint64_t duration;
+        CAFFCredits credits;
+        CIFF ciff;
+
         file.read((char *)&id, 1);
         file.read((char *)&length, 8);
-        file.read((char *)&duration, 8);
 
-        CIFF ciff = constructCiff(file);
+        switch (id)
+        {
+        case 2:
+        //Credit block
+            caff.credits = read_credits(file);
+            break;
+        case 3:
+        //CIFF block
+            file.read((char *)&duration, 8);
 
-        if (i == 0)
-            createJpgFromCiff(ciff, filePath);
+            ciff = constructCiff(file);
+            caff.ciffs.push_back(ciff);
+            ciffCount++;
+            break;
+        default:
+            throw runtime_error("Invalid block ID");
+            break;
+        }
+        if (ciffCount == caff.header.numAnimations)
+            break;
     }
 
     file.close();
 
-    return 0;
+    return caff;
 }
 
-int handleCiff(string filePath)
+//Cheks if the remaining number of bytes equal to the given content size
+bool checkCorrectByteNumber(std::ifstream &file, int contentSize)
 {
+    // Get the current position
+    file.seekg(0, std::ios::cur);
+    std::streampos currentPos = file.tellg();
+
+    // Go to the end of the file
+    file.seekg(0, std::ios::end);
+    std::streampos endPos = file.tellg();
+
+    // Go back to the original position
+    file.seekg(currentPos);
+
+    std::streamoff remainingBytes = endPos - currentPos;
+
+    if (remainingBytes == contentSize)
+        return true;
+
+    return false;
+}
+
+CIFF handleCiff(string filePath)
+{
+    CIFF ciff;
     std::ifstream file(filePath);
     if (!file)
     {
         std::cerr << "Failed to open the file" << std::endl;
-        return -1;
+        throw runtime_error("Failed to open the file");
     }
 
-    // std::ifstream file(argv[1], std::ios::binary);
+    findMagic(file, "CIFF");
 
     // Read header
-    CIFFHeader header = read_CiffHeader(file);
+    ciff.header = read_CiffHeader(file);
+
+    if (!checkCorrectByteNumber(file, ciff.header.content_size))
+        throw std::runtime_error("Wrong content-size");
 
     // Read Pixels
-    std::vector<uint8_t> pixels(header.content_size);
-    file.read((char *)pixels.data(), header.content_size);
+    std::vector<uint8_t> pixels(ciff.header.content_size);
+    file.read((char *)pixels.data(), ciff.header.content_size);
 
-    if ((header.height == 0 || header.width == 0) && pixels.size() != 0)
-        return -1;
+     ciff.pixels= pixels;
 
-    string ciffPath = createJpgPath(filePath);
-    // Convert to JPEG
-    write_jpeg(pixels, header.width, header.height, ciffPath);
+    file.close();
 
-    // std::cout << std::endl <<"vÉGE";
-    return 0;
+    return ciff;
 }
 
 int main(int argc, char *argv[])
 {
-    string filePath = argv[2];
+    if (argc != 3)
+    {
+        throw runtime_error("Invalid argument count");
+    }
+
     string ciffOrCaff = argv[1];
-    // std::cout << " " << argv[0] << " " << argv[1] << " " << argv[2];
-    // std::cout<<"hello";
-    /*if (argc != 3) {
-        std::cout << "UDFASSSSSSSSSSSSSSSSSSSSSsage: ciff_to_jpg <input.ciff> <output.jpg>\n";
-        std::cout << argc<<std::endl<<std::endl;
-        std::cout << "Usage: ciff_to_jpg <input.ciff> <output.jpFSDDDDDDDDDg>\n";
-        return -1;
-    }*/
+    string filePath = argv[2];
 
     try
     {
-        if (ciffOrCaff == "-caff")
+        if (strcmp(argv[1], "-caff") == 0)
         {
-            return handleCaff(filePath);
+            CAFF caff = handleCaff(filePath);
+            createJpgFromCiff(caff.ciffs[0], filePath);
+            return 0;
+        }
+        else if (strcmp(argv[1], "-ciff") == 0)
+        {
+            CIFF ciff = handleCiff(filePath);
+            createJpgFromCiff(ciff, filePath);
+            return 0;
         }
         else
         {
-            return handleCiff(filePath);
+            throw runtime_error("The program can only handle CIFF or CAFF files");
         }
     }
     catch (const exception &ex)
